@@ -11,7 +11,7 @@ interface Video {
 }
 
 interface VideoModalProps {
-  video: Video;
+  video: Video | null;
   onClose: () => void;
 }
 
@@ -34,12 +34,35 @@ export default function VideoModal({ video, onClose }: VideoModalProps) {
     };
   }, [onClose]);
 
-  const videoUrl = `http://localhost:8080${video.filePath}`;
+  if (!video) {
+    return null;
+  }
+
+  const videoUrl = `http://localhost:8080/${video.id}_${video.filename}`;
 
   return (
     <div className="video-modal" onClick={onClose}>
-      <div className="video-modal-content" onClick={(e) => e.stopPropagation()}>
-        <button className="video-modal-close" onClick={onClose}>
+      <div className="video-modal-content" onClick={(e) => e.stopPropagation()} style={{ position: 'relative' }} >
+        <button className="video-modal-close" onClick={onClose}
+        style={{
+            position: 'absolute',
+            top: '10px',
+            right: '10px',
+            zIndex: 9999, // Ensures it sits ON TOP of the video
+            cursor: 'pointer',
+            backgroundColor: 'rgba(0, 0, 0, 0.6)', // Semi-transparent black background
+            color: 'white',
+            border: 'none',
+            borderRadius: '50%',
+            width: '32px',
+            height: '32px',
+            display: 'flex',
+            alignItems: 'center',
+            justifyContent: 'center',
+            fontSize: '20px',
+            fontWeight: 'bold',
+            padding: 0,
+          }}>
           ×
         </button>
         <video

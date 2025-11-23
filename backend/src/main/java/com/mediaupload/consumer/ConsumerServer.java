@@ -295,13 +295,15 @@ public class ConsumerServer {
                 // Add to hash set for duplicate detection
                 videoHashes.add(task.getHash());
                 
+                String webUrl = "http://localhost:8080/" + task.getFileId() + "_" + task.getFilename();
+
                 // Create metadata
                 VideoMetadata metadata = new VideoMetadata(
                         task.getFileId(),
                         task.getFilename(),
                         task.getData().length,
                         System.currentTimeMillis(),
-                        filePath
+                        webUrl
                 );
                 
                 uploadedVideos.put(task.getFileId(), metadata);
