@@ -511,11 +511,11 @@ public class ConsumerServer {
     private final int consumerThreadCount;
     private final Map<String, VideoMetadata> uploadedVideos;
     
-    // Maps for deduplication
-    private final Map<String, String> videoHashToId;
-    private final Map<String, String> filenameToId;
+    // Maps for deduplication (ConcurrentHashMap acts as our thread-safe lock)
+    private final ConcurrentHashMap<String, String> videoHashToId;
+    private final ConcurrentHashMap<String, String> filenameToId;
     
-    // Kept for consistency, though less critical with strict deduplication
+    // Kept for consistency
     private final Map<String, String> idToFilename; 
     
     public ConsumerServer(int port, int consumerThreads, int maxQueueSize) {
@@ -572,7 +572,6 @@ public class ConsumerServer {
         Spark.get("/api/videos", (req, res) -> {
             res.type("application/json");
             
-            // Map internal metadata to public API format
             return gson.toJson(uploadedVideos.values().stream()
                     .map(meta -> new VideoInfo(
                         meta.getFileId(),
@@ -646,86 +645,119 @@ public class ConsumerServer {
                 private ByteArrayOutputStream videoData = new ByteArrayOutputStream();
                 private final String fileId = UUID.randomUUID().toString();
                 
+                // State for stream draining
+                private boolean isDuplicate = false;
+                private String existingDuplicateId = "";
+                
+                // Track if WE reserved the lock, so we can clean it up on failure
+                private boolean reservedHash = false;
+                private boolean reservedFilename = false;
+
                 @Override
                 public void onNext(VideoChunk chunk) {
                     if (chunk.getChunkIndex() == 0) {
                         filename = chunk.getFilename();
                         fileHash = chunk.getHash();
                         
-                        // 1. Check Hash Duplicate (Strict Deduplication)
-                        if (videoHashToId.containsKey(fileHash)) {
-                            String existingId = videoHashToId.get(fileHash);
-                            logger.info("Duplicate content detected for {}. Skipping GUI upload.", filename);
+                        // 1. ATTEMPT TO RESERVE HASH (Atomic Check-and-Act)
+                        // putIfAbsent returns null if we successfully put it. 
+                        // It returns the existing value if someone else beat us to it.
+                        String previousId = videoHashToId.putIfAbsent(fileHash, fileId);
+                        
+                        if (previousId != null) {
+                            // someone else already reserved this hash!
+                            isDuplicate = true;
+                            existingDuplicateId = previousId;
+                            logger.info("Duplicate detected {}. Draining stream...", filename);
+                        } else {
+                            // We successfully reserved it.
+                            reservedHash = true;
                             
-                            // Immediately return SUCCESS to Producer so it doesn't timeout.
-                            // But we do NOT add it to uploadedVideos, so it won't show on GUI.
-                            responseObserver.onNext(UploadResponse.newBuilder()
-                                    .setSuccess(true)
-                                    .setMessage("Duplicate detected (Skipped)")
-                                    .setFileId(existingId)
-                                    .setIsDuplicate(true)
-                                    .build());
-                            responseObserver.onCompleted();
-                            return;
-                        }
+                            // 2. CHECK FILENAME COLLISION
+                            // Since we have the hash lock, we now check the filename lock.
+                            if (filenameToId.containsKey(filename)) {
+                                String baseName = filename;
+                                String extension = "";
+                                int dotIndex = filename.lastIndexOf('.');
+                                if (dotIndex >= 0) {
+                                    baseName = filename.substring(0, dotIndex);
+                                    extension = filename.substring(dotIndex);
+                                }
 
-                        // 2. Check Filename Collision (Name Match)
-                        // This handles the case where hash is different but name is same
-                        if (filenameToId.containsKey(filename)) {
-                            String baseName = filename;
-                            String extension = "";
-                            int dotIndex = filename.lastIndexOf('.');
-                            if (dotIndex >= 0) {
-                                baseName = filename.substring(0, dotIndex);
-                                extension = filename.substring(dotIndex);
+                                int counter = 2;
+                                while (filenameToId.containsKey(filename)) {
+                                    filename = baseName + " (" + counter + ")" + extension;
+                                    counter++;
+                                }
+                                logger.info("Renaming collision to {}", filename);
                             }
-
-                            int counter = 2;
-                            while (filenameToId.containsKey(filename)) {
-                                filename = baseName + " (" + counter + ")" + extension;
-                                counter++;
-                            }
-                            logger.info("Renaming collision to {}", filename);
+                            
+                            // Reserve the (possibly new) filename
+                            filenameToId.put(filename, fileId);
+                            reservedFilename = true;
+                            idToFilename.put(fileId, filename);
                         }
                     }
-                    
-                    // Safety check
-                    if (videoHashToId.containsKey(fileHash)) return;
+
+                    // --- STREAM DRAINING LOGIC ---
+                    if (isDuplicate) {
+                         if (chunk.getIsLastChunk()) {
+                             responseObserver.onNext(UploadResponse.newBuilder()
+                                    .setSuccess(true)
+                                    .setMessage("Duplicate detected (Skipped)")
+                                    .setFileId(existingDuplicateId)
+                                    .setIsDuplicate(true)
+                                    .build());
+                             responseObserver.onCompleted();
+                         }
+                         return; 
+                    }
+                    // -----------------------------
 
                     try {
                         chunk.getData().writeTo(videoData);
                     } catch (IOException e) {
+                        cleanupLocks();
                         responseObserver.onError(e);
                         return;
                     }
                     
                     if (chunk.getIsLastChunk()) {
                         if (queue.remainingCapacity() == 0) {
+                            cleanupLocks(); // Release locks so others can try
                             responseObserver.onNext(UploadResponse.newBuilder().setSuccess(false).setMessage("Queue Full").setQueueFull(true).build());
                             responseObserver.onCompleted();
                             return;
                         }
                         
-                        // Register mappings
-                        videoHashToId.put(fileHash, fileId);
-                        filenameToId.put(filename, fileId); 
-                        idToFilename.put(fileId, filename); 
+                        // We already reserved the locks at chunk 0.
+                        // Now we just queue the data.
 
                         VideoUploadTask task = new VideoUploadTask(fileId, filename, videoData.toByteArray(), fileHash);
                         
                         if (queue.offer(task)) {
                             responseObserver.onNext(UploadResponse.newBuilder().setSuccess(true).setMessage("Queued").setFileId(fileId).build());
                         } else {
-                            // Rollback
-                            videoHashToId.remove(fileHash);
-                            filenameToId.remove(filename);
-                            idToFilename.remove(fileId);
+                            // Queue failed unexpectedly
+                            cleanupLocks();
                             responseObserver.onNext(UploadResponse.newBuilder().setSuccess(false).setMessage("Queue Full").build());
                         }
                         responseObserver.onCompleted();
                     }
                 }
-                @Override public void onError(Throwable t) { logger.error("Upload stream error", t); }
+                
+                private void cleanupLocks() {
+                    if (reservedHash) videoHashToId.remove(fileHash);
+                    if (reservedFilename) filenameToId.remove(filename);
+                    if (reservedFilename) idToFilename.remove(fileId);
+                }
+                
+                @Override 
+                public void onError(Throwable t) { 
+                    cleanupLocks(); 
+                    logger.error("Upload stream error", t); 
+                }
+                
                 @Override public void onCompleted() {}
             };
         }
