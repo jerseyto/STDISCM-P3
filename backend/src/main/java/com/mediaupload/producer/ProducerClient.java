@@ -12,8 +12,6 @@ import io.grpc.netty.shaded.io.grpc.netty.NettyChannelBuilder;
 import java.net.InetSocketAddress;
 
 import java.io.*;
-import java.net.InetAddress;
-import java.net.InetSocketAddress;
 import java.nio.file.Files;
 import java.nio.file.Path;
 import java.nio.file.Paths;
@@ -23,11 +21,14 @@ import java.util.concurrent.ExecutorService;
 import java.util.concurrent.Executors;
 import java.util.concurrent.TimeUnit;
 import java.util.concurrent.ConcurrentHashMap;
+import java.util.concurrent.atomic.AtomicBoolean;
+import java.util.concurrent.atomic.AtomicInteger;
 
 public class ProducerClient {
     private static final Logger logger = LoggerFactory.getLogger(ProducerClient.class);
     private final ManagedChannel channel;
     private final MediaUploadServiceGrpc.MediaUploadServiceStub asyncStub;
+    private final MediaUploadServiceGrpc.MediaUploadServiceBlockingStub blockingStub;
     private final String serverHost;
     private final int serverPort;
     
@@ -35,58 +36,154 @@ public class ProducerClient {
         this.serverHost = host == null || host.trim().isEmpty() ? "localhost" : host.trim();
         this.serverPort = port;
 
-        // make sure host is just "localhost" or "192.168.x.x" (no :port)
         logger.info("Connecting to consumer server at {}:{}", this.serverHost, this.serverPort);
-        logger.info("Creating gRPC channel to {}:{}", this.serverHost, this.serverPort);
 
-        // Force Netty to use a plain InetSocketAddress directly
         InetSocketAddress address = new InetSocketAddress(this.serverHost, this.serverPort);
 
         this.channel = NettyChannelBuilder
-                .forAddress(address)               // <— direct InetSocketAddress, no name resolver
-                .usePlaintext()                    // no TLS for local testing
+                .forAddress(address)
+                .usePlaintext()
                 .maxInboundMessageSize(100 * 1024 * 1024) // 100MB max
                 .build();
 
         this.asyncStub = MediaUploadServiceGrpc.newStub(channel);
+        this.blockingStub = MediaUploadServiceGrpc.newBlockingStub(channel);
         logger.info("gRPC channel created successfully");
-
-
     }
     
-    public void uploadVideo(String videoPath, String folderName) {
+    public boolean isQueueAvailable() {
+        try {
+            QueueStatusResponse response = blockingStub
+                    .withDeadlineAfter(5, TimeUnit.SECONDS)
+                    .checkQueueStatus(QueueStatusRequest.newBuilder().build());
+            
+            if (response.getQueueFull()) {
+                logger.warn("Queue is FULL ({}/{}). Cannot accept uploads.", 
+                        response.getQueueSize(), response.getMaxQueueSize());
+                return false;
+            }
+            
+        
+            double fillPercentage = (double) response.getQueueSize() / response.getMaxQueueSize();
+            if (fillPercentage > 0.8) {
+                logger.info("Queue is {}% full ({}/{})", 
+                        (int)(fillPercentage * 100), 
+                        response.getQueueSize(), 
+                        response.getMaxQueueSize());
+            }
+            
+            return true;
+        } catch (Exception e) {
+            logger.error("Failed to check queue status: {}", e.getMessage());
+            return false; 
+        }
+    }
+    
+    public void uploadVideoWithQueueCheck(String videoPath, String folderName, int producerId) {
+        int maxRetries = 5;
+        int retryDelayMs = 3000; 
+        
+        for (int attempt = 1; attempt <= maxRetries; attempt++) {
+            
+            if (!isQueueAvailable()) {
+                if (attempt < maxRetries) {
+                    logger.info("Producer {}: Queue full, retry {}/{} in {} seconds for: {}", 
+                            producerId, attempt, maxRetries, retryDelayMs / 1000, 
+                            Paths.get(videoPath).getFileName());
+                    try {
+                        Thread.sleep(retryDelayMs);
+                        retryDelayMs = (int)(retryDelayMs * 1.5); 
+                    } catch (InterruptedException e) {
+                        Thread.currentThread().interrupt();
+                        return;
+                    }
+                    continue;
+                } else {
+                    logger.error("Producer {}: Queue full after {} retries. DROPPING video: {}", 
+                            producerId, maxRetries, videoPath);
+                    return;
+                }
+            }
+            
+            UploadResult result = uploadVideoInternal(videoPath, folderName, producerId);
+            
+            if (result.success  && !result.isDuplicate) {
+                logger.info("Producer {}: Upload successful: {}", 
+                        producerId, Paths.get(videoPath).getFileName());
+                return; 
+            } else if (result.isDuplicate) {
+                logger.info("Producer {}: Duplicate detected (skipping): {}", 
+                        producerId, Paths.get(videoPath).getFileName());
+                return; 
+            } else if (result.queueFull) {
+               
+                if (attempt < maxRetries) {
+                    logger.warn("Producer {}: Queue became full during upload. Retry {}/{} in {} seconds", 
+                            producerId, attempt, maxRetries, retryDelayMs / 1000);
+                    try {
+                        Thread.sleep(retryDelayMs);
+                        retryDelayMs = (int)(retryDelayMs * 1.5); 
+                    } catch (InterruptedException e) {
+                        Thread.currentThread().interrupt();
+                        return;
+                    }
+                    continue;
+                } else {
+                    logger.error("Producer {}: Queue full after {} retries. DROPPING video: {}", 
+                            producerId, maxRetries, videoPath);
+                    return;
+                }
+            } else {
+               
+                logger.error("Producer {}: Upload failed: {}", producerId, result.message);
+                return; 
+            }
+        }
+    }
+    
+    private UploadResult uploadVideoInternal(String videoPath, String folderName, int producerId) {
         try {
             Path path = Paths.get(videoPath);
             String filename = path.getFileName().toString();
             
-            // Calculate file hash for duplicate detection
             String fileHash = calculateFileHash(path);
             
-            // Read file
             byte[] fileData = Files.readAllBytes(path);
-            int chunkSize = 64 * 1024; // 64KB chunks
+            int chunkSize = 64 * 1024;
             int totalChunks = (int) Math.ceil((double) fileData.length / chunkSize);
             
             CountDownLatch finishLatch = new CountDownLatch(1);
+            UploadResult result = new UploadResult();
             
             StreamObserver<VideoChunk> requestObserver = asyncStub.uploadVideo(
                     new StreamObserver<UploadResponse>() {
                         @Override
                         public void onNext(UploadResponse response) {
+                            result.success = response.getSuccess();
+                            result.queueFull = response.getQueueFull();
+                            result.isDuplicate = response.getIsDuplicate();
+                            result.message = response.getMessage();
+                            result.fileId = response.getFileId();
+                            
                             if (response.getQueueFull()) {
-                                logger.warn("Queue is full for video: {}", filename);
+                                logger.debug("Producer {}: Server reports queue full for: {}", 
+                                        producerId, filename);
                             } else if (response.getIsDuplicate()) {
+                                logger.debug("Producer {}: Server reports duplicate for: {}", 
+                                        producerId, filename);
                                 logger.info("Duplicate video detected: {}", filename);
                             } else if (response.getSuccess()) {
-                                logger.info("Video uploaded successfully: {} (ID: {})", filename, response.getFileId());
-                            } else {
-                                logger.error("Upload failed: {}", response.getMessage());
+                                logger.debug("Producer {}: Server accepted: {} (ID: {})", 
+                                        producerId, filename, response.getFileId());
                             }
                         }
                         
                         @Override
                         public void onError(Throwable t) {
-                            logger.error("Upload error for video: {}", filename, t);
+                            logger.error("Producer {}: Upload stream error for: {}", 
+                                    producerId, filename, t);
+                            result.success = false;
+                            result.message = "Stream error: " + t.getMessage();
                             finishLatch.countDown();
                         }
                         
@@ -96,7 +193,6 @@ public class ProducerClient {
                         }
                     });
             
-            // Send chunks
             for (int i = 0; i < totalChunks; i++) {
                 int start = i * chunkSize;
                 int end = Math.min(start + chunkSize, fileData.length);
@@ -116,13 +212,20 @@ public class ProducerClient {
             
             requestObserver.onCompleted();
             
-            // Wait for completion
-            if (!finishLatch.await(1, TimeUnit.MINUTES)) {
-                logger.warn("Upload timeout for video: {}", filename);
+            if (!finishLatch.await(2, TimeUnit.MINUTES)) {
+                logger.warn("Producer {}: Upload timeout for: {}", producerId, filename);
+                result.success = false;
+                result.message = "Upload timeout";
             }
             
+            return result;
+            
         } catch (Exception e) {
-            logger.error("Error uploading video: {}", videoPath, e);
+            logger.error("Producer {}: Error uploading video: {}", producerId, videoPath, e);
+            UploadResult result = new UploadResult();
+            result.success = false;
+            result.message = "Exception: " + e.getMessage();
+            return result;
         }
     }
     
@@ -136,15 +239,10 @@ public class ProducerClient {
     public void checkQueueStatus() throws Exception {
         try {
             logger.info("Attempting to connect to gRPC server...");
-            MediaUploadServiceGrpc.MediaUploadServiceBlockingStub blockingStub =
-                    MediaUploadServiceGrpc.newBlockingStub(channel);
             
-            // Add a timeout to avoid hanging
-            blockingStub = blockingStub.withDeadlineAfter(10, TimeUnit.SECONDS);
-            
-            logger.info("Calling checkQueueStatus RPC...");
-            QueueStatusResponse response = blockingStub.checkQueueStatus(
-                    QueueStatusRequest.newBuilder().build());
+            QueueStatusResponse response = blockingStub
+                    .withDeadlineAfter(10, TimeUnit.SECONDS)
+                    .checkQueueStatus(QueueStatusRequest.newBuilder().build());
             
             logger.info("RPC call successful!");
             if (response.getQueueFull()) {
@@ -172,9 +270,6 @@ public class ProducerClient {
         channel.shutdown().awaitTermination(5, TimeUnit.SECONDS);
     }
     
-    /**
-     * Scans folder and uploads all video files that haven't been uploaded yet
-     */
     private static void scanAndUploadVideos(ProducerClient client, Path folder, String folderName, 
                                            Set<String> uploadedFiles, int producerId) {
         try {
@@ -184,17 +279,16 @@ public class ProducerClient {
                     .forEach(videoPath -> {
                         String absolutePath = videoPath.toAbsolutePath().toString();
                         
-                        // Skip if already uploaded
                         if (uploadedFiles.contains(absolutePath)) {
-                            logger.debug("Producer {}: Skipping already uploaded file: {}", producerId, videoPath.getFileName());
+                            logger.debug("Producer {}: Skipping already uploaded file: {}", 
+                                    producerId, videoPath.getFileName());
                             return;
                         }
                         
-                        // Wait for file to stabilize (in case it's still being written)
                         if (waitForFileStable(videoPath)) {
                             logger.info("Producer {}: Uploading {}", producerId, videoPath.getFileName());
-                            client.uploadVideo(absolutePath, folderName);
-                            uploadedFiles.add(absolutePath); // Mark as uploaded
+                            client.uploadVideoWithQueueCheck(absolutePath, folderName, producerId);
+                            uploadedFiles.add(absolutePath);
                         } else {
                             logger.warn("Producer {}: File {} appears to be still writing, will retry later", 
                                     producerId, videoPath.getFileName());
@@ -205,33 +299,26 @@ public class ProducerClient {
         }
     }
     
-    /**
-     * Continuously monitors folder for new video files
-     */
     private static void monitorFolderForNewVideos(ProducerClient client, Path folder, String folderName,
                                                  Set<String> uploadedFiles, int producerId) {
         logger.info("Producer {}: Continuous monitoring started for folder: {}", producerId, folder);
         
-        // Poll interval: check for new files every 3 seconds
         final long pollIntervalSeconds = 3;
         
         while (!Thread.currentThread().isInterrupted()) {
             try {
-                // Scan for new files
                 Files.walk(folder)
                         .filter(Files::isRegularFile)
                         .filter(p -> isVideoFile(p))
                         .forEach(videoPath -> {
                             String absolutePath = videoPath.toAbsolutePath().toString();
                             
-                            // Check if this is a new file we haven't uploaded yet
                             if (!uploadedFiles.contains(absolutePath)) {
-                                // Wait for file to stabilize before uploading
                                 if (waitForFileStable(videoPath)) {
                                     logger.info("Producer {}: New file detected, uploading: {}", 
                                             producerId, videoPath.getFileName());
-                                    client.uploadVideo(absolutePath, folderName);
-                                    uploadedFiles.add(absolutePath); // Mark as uploaded
+                                    client.uploadVideoWithQueueCheck(absolutePath, folderName, producerId);
+                                    uploadedFiles.add(absolutePath);
                                 } else {
                                     logger.debug("Producer {}: File {} still writing, will check again later", 
                                             producerId, videoPath.getFileName());
@@ -239,7 +326,6 @@ public class ProducerClient {
                             }
                         });
                 
-                // Sleep before next poll
                 Thread.sleep(pollIntervalSeconds * 1000);
                 
             } catch (InterruptedException e) {
@@ -249,7 +335,7 @@ public class ProducerClient {
             } catch (Exception e) {
                 logger.error("Producer {}: Error during folder monitoring: {}", producerId, e.getMessage());
                 try {
-                    Thread.sleep(pollIntervalSeconds * 1000); // Continue monitoring despite error
+                    Thread.sleep(pollIntervalSeconds * 1000);
                 } catch (InterruptedException ie) {
                     Thread.currentThread().interrupt();
                     break;
@@ -260,9 +346,6 @@ public class ProducerClient {
         logger.info("Producer {}: Continuous monitoring stopped", producerId);
     }
     
-    /**
-     * Checks if a file is a video file based on extension
-     */
     private static boolean isVideoFile(Path path) {
         String name = path.toString().toLowerCase();
         return name.endsWith(".mp4") || name.endsWith(".avi") || 
@@ -270,47 +353,48 @@ public class ProducerClient {
                name.endsWith(".webm");
     }
     
-    /**
-     * Waits for a file to stabilize (stop being written to) before uploading
-     * Returns true if file is stable, false if timeout
-     */
     private static boolean waitForFileStable(Path filePath) {
         try {
-            long stableCheckInterval = 2000; // Check every 2 seconds
-            int maxChecks = 5; // Check up to 5 times (10 seconds total)
+            long stableCheckInterval = 2000; 
+            int maxChecks = 5;
             
             long lastSize = -1;
             int stableCount = 0;
             
             for (int i = 0; i < maxChecks; i++) {
                 if (!Files.exists(filePath)) {
-                    return false; // File doesn't exist
+                    return false;
                 }
                 
                 long currentSize = Files.size(filePath);
                 
-                // If file size hasn't changed, it might be stable
                 if (currentSize == lastSize && currentSize > 0) {
                     stableCount++;
                     if (stableCount >= 2) {
-                        // File size has been stable for 2 checks (4 seconds), consider it stable
                         return true;
                     }
                 } else {
-                    stableCount = 0; // Reset counter if size changed
+                    stableCount = 0;
                 }
                 
                 lastSize = currentSize;
                 Thread.sleep(stableCheckInterval);
             }
             
-            // If file size is non-zero and hasn't changed in last check, assume it's stable
             return lastSize > 0;
             
         } catch (Exception e) {
             logger.warn("Error checking file stability for {}: {}", filePath, e.getMessage());
             return false;
         }
+    }
+    
+    private static class UploadResult {
+        boolean success = false;
+        boolean queueFull = false;
+        boolean isDuplicate = false;
+        String message = "";
+        String fileId = "";
     }
     
     public static void main(String[] args) throws InterruptedException {
@@ -339,41 +423,25 @@ public class ProducerClient {
         
         ProducerClient client = new ProducerClient(host, port);
         
-        // Test connection before starting uploads
-        System.out.println("Testing connection to consumer server...");
+        System.out.println("\n=== Testing connection to consumer server ===");
         try {
             client.checkQueueStatus();
-            System.out.println("Connection successful! Starting uploads...");
+            System.out.println("Connection successful! Starting uploads...\n");
         } catch (Exception e) {
             System.err.println("ERROR: Cannot connect to consumer server at " + host + ":" + port);
-            System.err.println("Please verify:");
-            System.err.println("  1. Consumer server is running (Terminal 1)");
-            System.err.println("  2. Host is correct (use 'localhost' for local machine)");
+            System.err.println("\nPlease verify:");
+            System.err.println("  1. Consumer server is running");
+            System.err.println("  2. Host is correct (use 'localhost' for same machine)");
             System.err.println("  3. Port matches consumer server port");
             System.err.println("  4. No firewall blocking the connection");
-            System.err.println("\nError details:");
-            if (e.getCause() != null) {
-                System.err.println("  Root cause: " + e.getCause().getClass().getSimpleName());
-                System.err.println("  Message: " + e.getCause().getMessage());
-            } else {
-                System.err.println("  " + e.getMessage());
-            }
-            if (e.getCause() instanceof java.net.ConnectException) {
-                System.err.println("\nThis usually means:");
-                System.err.println("  - Consumer server is not running");
-                System.err.println("  - Wrong port number");
-                System.err.println("  - Firewall blocking connection");
-            }
+            System.err.println("\nError details: " + e.getMessage());
             scanner.close();
             System.exit(1);
         }
         
         ExecutorService executor = Executors.newFixedThreadPool(producerThreads);
-        
-        // Shared set to track uploaded files across all threads (by absolute path)
         Set<String> uploadedFiles = ConcurrentHashMap.newKeySet();
         
-        // Create producer threads with continuous monitoring
         for (int i = 0; i < producerThreads; i++) {
             final int threadIndex = i;
             final String folderPath = Paths.get(baseFolderPath, "folder" + (threadIndex + 1)).toString();
@@ -382,26 +450,27 @@ public class ProducerClient {
                 try {
                     Path folder = Paths.get(folderPath);
                     if (!Files.exists(folder)) {
-                        logger.warn("Folder does not exist: {}", folderPath);
+                        logger.warn("Producer {}: Folder does not exist: {}", threadIndex + 1, folderPath);
                         return;
                     }
                     
-                    logger.info("Producer {}: Starting continuous monitoring of folder: {}", threadIndex + 1, folderPath);
+                    logger.info("Producer {}: Starting continuous monitoring of folder: {}", 
+                            threadIndex + 1, folderPath);
                     
-                    // First, scan and upload existing files
-                    scanAndUploadVideos(client, folder, "folder" + (threadIndex + 1), uploadedFiles, threadIndex + 1);
+                    scanAndUploadVideos(client, folder, "folder" + (threadIndex + 1), 
+                            uploadedFiles, threadIndex + 1);
                     
-                    // Then continuously monitor for new files
-                    monitorFolderForNewVideos(client, folder, "folder" + (threadIndex + 1), uploadedFiles, threadIndex + 1);
+                    monitorFolderForNewVideos(client, folder, "folder" + (threadIndex + 1), 
+                            uploadedFiles, threadIndex + 1);
                     
                 } catch (Exception e) {
-                    logger.error("Error in producer thread {}", threadIndex + 1, e);
+                    logger.error("Producer {}: Error in producer thread", threadIndex + 1, e);
                 }
             });
         }
         
-        // Keep running
         Runtime.getRuntime().addShutdownHook(new Thread(() -> {
+            logger.info("Shutting down producer client...");
             executor.shutdown();
             try {
                 client.shutdown();
@@ -410,6 +479,7 @@ public class ProducerClient {
             }
         }));
         
+        System.out.println("=== Producer is running. Press Ctrl+C to stop ===\n");
         executor.awaitTermination(Long.MAX_VALUE, TimeUnit.SECONDS);
     }
 }

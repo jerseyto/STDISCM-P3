@@ -511,11 +511,9 @@ public class ConsumerServer {
     private final int consumerThreadCount;
     private final Map<String, VideoMetadata> uploadedVideos;
     
-    // Maps for deduplication (ConcurrentHashMap acts as our thread-safe lock)
     private final ConcurrentHashMap<String, String> videoHashToId;
     private final ConcurrentHashMap<String, String> filenameToId;
     
-    // Kept for consistency
     private final Map<String, String> idToFilename; 
     
     public ConsumerServer(int port, int consumerThreads, int maxQueueSize) {
@@ -645,11 +643,9 @@ public class ConsumerServer {
                 private ByteArrayOutputStream videoData = new ByteArrayOutputStream();
                 private final String fileId = UUID.randomUUID().toString();
                 
-                // State for stream draining
                 private boolean isDuplicate = false;
                 private String existingDuplicateId = "";
                 
-                // Track if WE reserved the lock, so we can clean it up on failure
                 private boolean reservedHash = false;
                 private boolean reservedFilename = false;
 
@@ -659,22 +655,17 @@ public class ConsumerServer {
                         filename = chunk.getFilename();
                         fileHash = chunk.getHash();
                         
-                        // 1. ATTEMPT TO RESERVE HASH (Atomic Check-and-Act)
-                        // putIfAbsent returns null if we successfully put it. 
-                        // It returns the existing value if someone else beat us to it.
                         String previousId = videoHashToId.putIfAbsent(fileHash, fileId);
                         
                         if (previousId != null) {
-                            // someone else already reserved this hash!
+                           
                             isDuplicate = true;
                             existingDuplicateId = previousId;
                             logger.info("Duplicate detected {}. Draining stream...", filename);
                         } else {
-                            // We successfully reserved it.
+                            
                             reservedHash = true;
                             
-                            // 2. CHECK FILENAME COLLISION
-                            // Since we have the hash lock, we now check the filename lock.
                             if (filenameToId.containsKey(filename)) {
                                 String baseName = filename;
                                 String extension = "";
@@ -692,14 +683,12 @@ public class ConsumerServer {
                                 logger.info("Renaming collision to {}", filename);
                             }
                             
-                            // Reserve the (possibly new) filename
                             filenameToId.put(filename, fileId);
                             reservedFilename = true;
                             idToFilename.put(fileId, filename);
                         }
                     }
 
-                    // --- STREAM DRAINING LOGIC ---
                     if (isDuplicate) {
                          if (chunk.getIsLastChunk()) {
                              responseObserver.onNext(UploadResponse.newBuilder()
@@ -724,21 +713,20 @@ public class ConsumerServer {
                     
                     if (chunk.getIsLastChunk()) {
                         if (queue.remainingCapacity() == 0) {
-                            cleanupLocks(); // Release locks so others can try
+                            cleanupLocks();
                             responseObserver.onNext(UploadResponse.newBuilder().setSuccess(false).setMessage("Queue Full").setQueueFull(true).build());
                             responseObserver.onCompleted();
                             return;
                         }
                         
-                        // We already reserved the locks at chunk 0.
-                        // Now we just queue the data.
+                      
 
                         VideoUploadTask task = new VideoUploadTask(fileId, filename, videoData.toByteArray(), fileHash);
                         
                         if (queue.offer(task)) {
                             responseObserver.onNext(UploadResponse.newBuilder().setSuccess(true).setMessage("Queued").setFileId(fileId).build());
                         } else {
-                            // Queue failed unexpectedly
+                            
                             cleanupLocks();
                             responseObserver.onNext(UploadResponse.newBuilder().setSuccess(false).setMessage("Queue Full").build());
                         }
@@ -787,7 +775,7 @@ public class ConsumerServer {
         
         private void processVideo(VideoUploadTask task) {
             try {
-                // Save RAW
+               
                 String rawName = "raw_" + task.getFileId() + "_" + task.getFilename();
                 File rawFile = new File(uploadDir, rawName);
                 try (FileOutputStream fos = new FileOutputStream(rawFile)) {
@@ -795,14 +783,13 @@ public class ConsumerServer {
                 }
                 
                 logger.info("Processing {}: Saved raw file. Compressing...", task.getFilename());
-                
-                // Compress
+               
                 String compressedName = task.getFileId() + "_" + task.getFilename();
                 File compressedFile = new File(uploadDir, compressedName);
                 boolean compressed = compressVideo(rawFile, compressedFile);
                 
                 File finalFile;
-                // --- SIZE CHECK ---
+              
                 if (compressed && compressedFile.length() < rawFile.length()) {
                     logger.info("Compression SUCCESS & SMALLER. Old: {} -> New: {}", rawFile.length(), compressedFile.length());
                     rawFile.delete(); 
@@ -836,7 +823,6 @@ public class ConsumerServer {
         }
     }
     
-    // Data Classes
     private static class VideoUploadTask {
         String fileId, filename, hash; byte[] data;
         VideoUploadTask(String id, String f, byte[] d, String h) { fileId=id; filename=f; data=d; hash=h; }
@@ -860,9 +846,9 @@ public class ConsumerServer {
         try {
             System.out.print("Enter port (50051): "); String p = s.nextLine().trim();
             if(!p.isEmpty()) port=Integer.parseInt(p);
-            System.out.print("Enter threads (4): "); String t = s.nextLine().trim();
+            System.out.print("Enter threads: "); String t = s.nextLine().trim();
             if(!t.isEmpty()) threads=Integer.parseInt(t);
-            System.out.print("Enter queue (10): "); String qs = s.nextLine().trim();
+            System.out.print("Enter max queue length: "); String qs = s.nextLine().trim();
             if(!qs.isEmpty()) q=Integer.parseInt(qs);
             
             ConsumerServer sv = new ConsumerServer(port, threads, q);
