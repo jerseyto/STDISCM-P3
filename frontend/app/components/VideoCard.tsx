@@ -32,7 +32,8 @@ export default function VideoCard({
   const previewVideoRef = useRef<HTMLVideoElement>(null);
 
   // Get video URL for preview
-  const videoUrl = `http://localhost:8080/${video.id}_${video.filename}`;
+  // const videoUrl = `http://localhost:8080/${video.id}_${video.filename}`;
+  const videoUrl = video.filePath;
 
   useEffect(() => {
     // Create thumbnail when component mounts

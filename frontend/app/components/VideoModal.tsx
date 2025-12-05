@@ -38,7 +38,8 @@ export default function VideoModal({ video, onClose }: VideoModalProps) {
     return null;
   }
 
-  const videoUrl = `http://localhost:8080/${video.id}_${video.filename}`;
+  // const videoUrl = `http://localhost:8080/${video.id}_${video.filename}`;
+  const videoUrl = video.filePath;
 
   return (
     <div className="video-modal" onClick={onClose}>
