@@ -17,11 +17,12 @@ import java.net.InetSocketAddress;
 import java.nio.file.Files;
 import java.nio.file.Path;
 import java.nio.file.Paths;
-import java.util.Scanner;
+import java.util.*;
 import java.util.concurrent.CountDownLatch;
 import java.util.concurrent.ExecutorService;
 import java.util.concurrent.Executors;
 import java.util.concurrent.TimeUnit;
+import java.util.concurrent.ConcurrentHashMap;
 
 public class ProducerClient {
     private static final Logger logger = LoggerFactory.getLogger(ProducerClient.class);
@@ -171,6 +172,147 @@ public class ProducerClient {
         channel.shutdown().awaitTermination(5, TimeUnit.SECONDS);
     }
     
+    /**
+     * Scans folder and uploads all video files that haven't been uploaded yet
+     */
+    private static void scanAndUploadVideos(ProducerClient client, Path folder, String folderName, 
+                                           Set<String> uploadedFiles, int producerId) {
+        try {
+            Files.walk(folder)
+                    .filter(Files::isRegularFile)
+                    .filter(p -> isVideoFile(p))
+                    .forEach(videoPath -> {
+                        String absolutePath = videoPath.toAbsolutePath().toString();
+                        
+                        // Skip if already uploaded
+                        if (uploadedFiles.contains(absolutePath)) {
+                            logger.debug("Producer {}: Skipping already uploaded file: {}", producerId, videoPath.getFileName());
+                            return;
+                        }
+                        
+                        // Wait for file to stabilize (in case it's still being written)
+                        if (waitForFileStable(videoPath)) {
+                            logger.info("Producer {}: Uploading {}", producerId, videoPath.getFileName());
+                            client.uploadVideo(absolutePath, folderName);
+                            uploadedFiles.add(absolutePath); // Mark as uploaded
+                        } else {
+                            logger.warn("Producer {}: File {} appears to be still writing, will retry later", 
+                                    producerId, videoPath.getFileName());
+                        }
+                    });
+        } catch (IOException e) {
+            logger.error("Producer {}: Error scanning folder: {}", producerId, e.getMessage());
+        }
+    }
+    
+    /**
+     * Continuously monitors folder for new video files
+     */
+    private static void monitorFolderForNewVideos(ProducerClient client, Path folder, String folderName,
+                                                 Set<String> uploadedFiles, int producerId) {
+        logger.info("Producer {}: Continuous monitoring started for folder: {}", producerId, folder);
+        
+        // Poll interval: check for new files every 3 seconds
+        final long pollIntervalSeconds = 3;
+        
+        while (!Thread.currentThread().isInterrupted()) {
+            try {
+                // Scan for new files
+                Files.walk(folder)
+                        .filter(Files::isRegularFile)
+                        .filter(p -> isVideoFile(p))
+                        .forEach(videoPath -> {
+                            String absolutePath = videoPath.toAbsolutePath().toString();
+                            
+                            // Check if this is a new file we haven't uploaded yet
+                            if (!uploadedFiles.contains(absolutePath)) {
+                                // Wait for file to stabilize before uploading
+                                if (waitForFileStable(videoPath)) {
+                                    logger.info("Producer {}: New file detected, uploading: {}", 
+                                            producerId, videoPath.getFileName());
+                                    client.uploadVideo(absolutePath, folderName);
+                                    uploadedFiles.add(absolutePath); // Mark as uploaded
+                                } else {
+                                    logger.debug("Producer {}: File {} still writing, will check again later", 
+                                            producerId, videoPath.getFileName());
+                                }
+                            }
+                        });
+                
+                // Sleep before next poll
+                Thread.sleep(pollIntervalSeconds * 1000);
+                
+            } catch (InterruptedException e) {
+                Thread.currentThread().interrupt();
+                logger.info("Producer {}: Monitoring interrupted", producerId);
+                break;
+            } catch (Exception e) {
+                logger.error("Producer {}: Error during folder monitoring: {}", producerId, e.getMessage());
+                try {
+                    Thread.sleep(pollIntervalSeconds * 1000); // Continue monitoring despite error
+                } catch (InterruptedException ie) {
+                    Thread.currentThread().interrupt();
+                    break;
+                }
+            }
+        }
+        
+        logger.info("Producer {}: Continuous monitoring stopped", producerId);
+    }
+    
+    /**
+     * Checks if a file is a video file based on extension
+     */
+    private static boolean isVideoFile(Path path) {
+        String name = path.toString().toLowerCase();
+        return name.endsWith(".mp4") || name.endsWith(".avi") || 
+               name.endsWith(".mov") || name.endsWith(".mkv") ||
+               name.endsWith(".webm");
+    }
+    
+    /**
+     * Waits for a file to stabilize (stop being written to) before uploading
+     * Returns true if file is stable, false if timeout
+     */
+    private static boolean waitForFileStable(Path filePath) {
+        try {
+            long stableCheckInterval = 2000; // Check every 2 seconds
+            int maxChecks = 5; // Check up to 5 times (10 seconds total)
+            
+            long lastSize = -1;
+            int stableCount = 0;
+            
+            for (int i = 0; i < maxChecks; i++) {
+                if (!Files.exists(filePath)) {
+                    return false; // File doesn't exist
+                }
+                
+                long currentSize = Files.size(filePath);
+                
+                // If file size hasn't changed, it might be stable
+                if (currentSize == lastSize && currentSize > 0) {
+                    stableCount++;
+                    if (stableCount >= 2) {
+                        // File size has been stable for 2 checks (4 seconds), consider it stable
+                        return true;
+                    }
+                } else {
+                    stableCount = 0; // Reset counter if size changed
+                }
+                
+                lastSize = currentSize;
+                Thread.sleep(stableCheckInterval);
+            }
+            
+            // If file size is non-zero and hasn't changed in last check, assume it's stable
+            return lastSize > 0;
+            
+        } catch (Exception e) {
+            logger.warn("Error checking file stability for {}: {}", filePath, e.getMessage());
+            return false;
+        }
+    }
+    
     public static void main(String[] args) throws InterruptedException {
         Scanner scanner = new Scanner(System.in);
         
@@ -228,7 +370,10 @@ public class ProducerClient {
         
         ExecutorService executor = Executors.newFixedThreadPool(producerThreads);
         
-        // Create producer threads
+        // Shared set to track uploaded files across all threads (by absolute path)
+        Set<String> uploadedFiles = ConcurrentHashMap.newKeySet();
+        
+        // Create producer threads with continuous monitoring
         for (int i = 0; i < producerThreads; i++) {
             final int threadIndex = i;
             final String folderPath = Paths.get(baseFolderPath, "folder" + (threadIndex + 1)).toString();
@@ -241,20 +386,15 @@ public class ProducerClient {
                         return;
                     }
                     
-                    // Monitor folder for video files
-                    Files.walk(folder)
-                            .filter(Files::isRegularFile)
-                            .filter(p -> {
-                                String name = p.toString().toLowerCase();
-                                return name.endsWith(".mp4") || name.endsWith(".avi") || 
-                                       name.endsWith(".mov") || name.endsWith(".mkv") ||
-                                       name.endsWith(".webm");
-                            })
-                            .forEach(videoPath -> {
-                                logger.info("Producer {}: Uploading {}", threadIndex + 1, videoPath.getFileName());
-                                client.uploadVideo(videoPath.toString(), "folder" + (threadIndex + 1));
-                            });
-                } catch (IOException e) {
+                    logger.info("Producer {}: Starting continuous monitoring of folder: {}", threadIndex + 1, folderPath);
+                    
+                    // First, scan and upload existing files
+                    scanAndUploadVideos(client, folder, "folder" + (threadIndex + 1), uploadedFiles, threadIndex + 1);
+                    
+                    // Then continuously monitor for new files
+                    monitorFolderForNewVideos(client, folder, "folder" + (threadIndex + 1), uploadedFiles, threadIndex + 1);
+                    
+                } catch (Exception e) {
                     logger.error("Error in producer thread {}", threadIndex + 1, e);
                 }
             });
