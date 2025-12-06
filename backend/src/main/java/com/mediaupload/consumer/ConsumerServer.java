@@ -860,9 +860,9 @@ public class ConsumerServer {
         try {
             System.out.print("Enter port (50051): "); String p = s.nextLine().trim();
             if(!p.isEmpty()) port=Integer.parseInt(p);
-            System.out.print("Enter threads (4): "); String t = s.nextLine().trim();
+            System.out.print("Enter number of consumer threads: "); String t = s.nextLine().trim();
             if(!t.isEmpty()) threads=Integer.parseInt(t);
-            System.out.print("Enter queue (10): "); String qs = s.nextLine().trim();
+            System.out.print("Enter max queue length: "); String qs = s.nextLine().trim();
             if(!qs.isEmpty()) q=Integer.parseInt(qs);
             
             ConsumerServer sv = new ConsumerServer(port, threads, q);
